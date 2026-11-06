@@ -1,0 +1,22 @@
+# homing-agent: runs the agent with its built-in supervisor, which starts each app via
+# homing-launch. Runs as root for now because flutter-pi needs DRM master and input devices;
+# per-app units and a dedicated user are planned.
+[Unit]
+Description=homing app update agent
+Documentation=https://github.com/trevortomlin/homing-agent
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/homing-agent --config /etc/homing/agent.toml
+RuntimeDirectory=homing
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+# The agent stops its apps itself (SIGTERM, SIGKILL after 5 s); give it time first.
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a new feature or a change in behavior.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and why is it hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: textarea
+    id: compat
+    attributes:
+      label: Compatibility impact
+      description: Does this change agent.toml, the socket API, the app environment or the on-device data layout? How are existing devices affected?
