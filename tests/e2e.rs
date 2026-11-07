@@ -9,9 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use homing_agent::rpc::Client;
-use homing_format::manifest::{
-    Arch, BuildMode, Compat, Embedder, Health, HealthMode, Manifest, Runtime,
-};
+use homing_format::manifest::{Arch, Compat, HealthMode, Manifest};
 use homing_format::{PackageWriter, SecretKey};
 use serde_json::{Value, json};
 
@@ -148,35 +146,13 @@ binary = "{}"
     }
 
     fn pkg(&self, name: &str, vc: u64, mode: &str, f: impl FnOnce(&mut Manifest)) -> PathBuf {
-        let mut m = Manifest {
-            schema: 1,
-            id: ID.into(),
-            name: "Hello".into(),
-            version: format!("1.0.{vc}"),
-            version_code: vc,
-            min_version_code: 0,
-            build_mode: BuildMode::Release,
-            runtime: Runtime {
-                embedder: Embedder::FlutterPi,
-                args: vec![],
-                env: Default::default(),
-            },
-            compat: Compat {
-                engine_hash: ENGINE.into(),
-                arch: Arch::Aarch64,
-                machines: vec!["raspberrypi3-64".into()],
-                graphics: Some(vec![homing_format::manifest::Graphics::DrmGles]),
-                base_image_min: None,
-            },
-            health: Health {
-                mode: HealthMode::Ready,
-                ready_timeout_s: 3,
-                trial_s: 2,
-            },
-            permissions: vec![],
-            files: vec![],
-            created: None,
-        };
+        let mut compat = Compat::new(ENGINE, Arch::Aarch64);
+        compat.machines = vec!["raspberrypi3-64".into()];
+        compat.graphics = Some(vec![homing_format::manifest::Graphics::DrmGles]);
+        let mut m = Manifest::new(ID, "Hello", format!("1.0.{vc}"), vc, compat);
+        m.health.mode = HealthMode::Ready;
+        m.health.ready_timeout_s = 3;
+        m.health.trial_s = 2;
         f(&mut m);
         let mut w = PackageWriter::new(0);
         w.add_bytes(

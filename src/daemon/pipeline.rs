@@ -112,11 +112,9 @@ fn stage(agent: &Agent, file: &Path) -> Result<(Manifest, Slot), Fail> {
         fs::remove_dir_all(&tmp).map_err(io_fail)?;
     }
     let f = fs::File::open(file).map_err(io_fail)?;
-    let opts = VerifyOptions {
-        trust: &agent.trust,
-        device: Some(&agent.device),
-        floor,
-    };
+    let opts = VerifyOptions::new(&agent.trust)
+        .device(&agent.device)
+        .floor(floor);
     let v = homing_format::verify_and_extract(f, opts, &tmp).map_err(fmt_fail)?;
     let m = v.manifest;
 
@@ -241,6 +239,8 @@ async fn trial(agent: &Agent, m: &Manifest, baseline: u64) -> Result<(), String>
                     return Ok(());
                 }
             }
+            // A health mode added by a newer format version: fail the trial (fail closed).
+            other => return Err(format!("unsupported health mode {other:?}")),
         }
     }
 }

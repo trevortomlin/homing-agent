@@ -127,12 +127,14 @@ pub fn adapter_argv(
                 BuildMode::Release => argv.push("--release".into()),
                 BuildMode::Profile => argv.push("--profile".into()),
                 BuildMode::Debug => {}
+                other => bail!("unsupported build mode {other:?}"),
             }
             argv.extend(extra.iter().map(OsString::from));
             argv.push(slot.join("bundle/flutter_assets").into());
             Ok(argv)
         }
         Embedder::IviHomescreen => bail!("the ivi-homescreen adapter is not implemented yet"),
+        other => bail!("unsupported embedder {other:?}"),
     }
 }
 
@@ -158,6 +160,7 @@ pub fn prepare_slot(cfg: &Config, slot: &Path, m: &Manifest) -> Result<()> {
             Ok(())
         }
         Embedder::IviHomescreen => bail!("the ivi-homescreen adapter is not implemented yet"),
+        other => bail!("unsupported embedder {other:?}"),
     }
 }
 
