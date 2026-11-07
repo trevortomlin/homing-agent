@@ -123,6 +123,14 @@ async fn dispatch(
 ) -> Result<Value, RpcError> {
     match method {
         "status" => Ok(status(agent)),
+        "rollback" => {
+            if !caller.is_admin() {
+                return Err(perm("rollback requires admin"));
+            }
+            let id = param_str(&params, "id")?;
+            let job_id = agent.request_rollback(id)?;
+            Ok(json!({ "job_id": job_id }))
+        }
         "source.check" => {
             if !caller.is_admin() {
                 return Err(perm("source.check requires admin"));

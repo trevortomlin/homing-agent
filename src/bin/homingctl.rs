@@ -39,6 +39,14 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Return an app to its previous version, marking the current one bad.
+    Rollback {
+        /// App id.
+        id: String,
+        /// Wait until the rollback finishes; exit non-zero unless it succeeded.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Check the HTTP update source now and queue any update it offers.
     Check {
         /// Print the result as JSON.
@@ -92,7 +100,17 @@ fn run() -> Result<ExitCode> {
             let id = r["job_id"].as_str().context("no job_id")?.to_owned();
             println!("job {id}");
             if wait {
-                wait_job(&mut c, &id)
+                wait_job(&mut c, &id, "committed")
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+        Cmd::Rollback { id, wait } => {
+            let r = c.call("rollback", json!({ "id": id }))?;
+            let job_id = r["job_id"].as_str().context("no job_id")?.to_owned();
+            println!("job {job_id}");
+            if wait {
+                wait_job(&mut c, &job_id, "rolled_back")
             } else {
                 Ok(ExitCode::SUCCESS)
             }
@@ -112,7 +130,7 @@ fn run() -> Result<ExitCode> {
         }
         Cmd::Job { job_id, wait } => {
             if wait {
-                return wait_job(&mut c, &job_id);
+                return wait_job(&mut c, &job_id, "committed");
             }
             println!(
                 "{}",
@@ -139,7 +157,8 @@ fn copy_to_incoming(cfg: &Config, file: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn wait_job(c: &mut Client, id: &str) -> Result<ExitCode> {
+/// Poll a job until it finishes. Exit 0 if it ended in `success`, else 2.
+fn wait_job(c: &mut Client, id: &str, success: &str) -> Result<ExitCode> {
     let mut last = String::new();
     loop {
         let j = c.call("job.get", json!({ "job_id": id }))?;
@@ -150,14 +169,16 @@ fn wait_job(c: &mut Client, id: &str) -> Result<ExitCode> {
             last = state.clone();
         }
         match state.as_str() {
-            "committed" => return Ok(ExitCode::SUCCESS),
-            "rolled_back" | "failed" => {
+            s if s == success => return Ok(ExitCode::SUCCESS),
+            "committed" | "rolled_back" | "failed" => {
                 let e = &j["error"];
-                println!(
-                    "  error: {} {}",
-                    e["code"].as_str().unwrap_or("?"),
-                    e["message"].as_str().unwrap_or("")
-                );
+                if e.is_object() {
+                    println!(
+                        "  error: {} {}",
+                        e["code"].as_str().unwrap_or("?"),
+                        e["message"].as_str().unwrap_or("")
+                    );
+                }
                 return Ok(ExitCode::from(2));
             }
             "?" => bail!("bad job object: {j}"),

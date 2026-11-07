@@ -471,9 +471,9 @@ fn http_source_installs_updates_from_a_signed_index() {
     // 1. First install: the app is configured but not installed yet. Relative URL.
     let v1 = pkg(1, "ok");
     publish(site.path(), &key, &[(1, ENGINE, "pkgs/v1.homing", &v1)]);
-    let (code, r) = e.check();
+    let (rc, r) = e.check();
     assert_eq!(
-        (code, app_result(&r)["result"].as_str()),
+        (rc, app_result(&r)["result"].as_str()),
         (0, Some("queued")),
         "{r}"
     );
@@ -509,6 +509,16 @@ fn http_source_installs_updates_from_a_signed_index() {
         e.status()["sources"]["http"]["apps"][0]["result"],
         "up_to_date"
     );
+
+    // 3b. After a manual rollback to v1, the source does not put v2 straight back.
+    let (rc, out) = e.homingctl(&["rollback", ID, "--wait"]);
+    assert_eq!(rc, 0, "{out}");
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["result"], "skipped_failed", "{r}");
+    assert_eq!(app_result(&r)["version_code"], 2, "{r}");
+    // Reinstall v2 by hand to continue.
+    let v2_local = e.root.join("v2.homing");
+    assert_eq!(code(&e.install(&v2_local)), "");
 
     // 4. A version that fails its trial is rolled back and not downloaded again.
     let v3 = pkg(3, "crash");
@@ -559,16 +569,16 @@ fn http_source_installs_updates_from_a_signed_index() {
         doc.replace("1.0.5", "1.0.6"),
     )
     .unwrap();
-    let (code, r) = e.check();
-    assert_eq!(code, 2);
+    let (rc, r) = e.check();
+    assert_eq!(rc, 2);
     assert!(r["last_error"].as_str().unwrap().contains("E_SIG"), "{r}");
     publish(
         site.path(),
         &SecretKey::from_seed(&[9; 32]),
         &[(5, ENGINE, "pkgs/v5.homing", &v5)],
     );
-    let (code, r) = e.check();
-    assert_eq!(code, 2);
+    let (rc, r) = e.check();
+    assert_eq!(rc, 2);
     assert!(
         r["last_error"].as_str().unwrap().contains("E_KEY_UNKNOWN"),
         "{r}"
@@ -576,8 +586,8 @@ fn http_source_installs_updates_from_a_signed_index() {
 
     // 8. An unreachable server is an error, not a crash.
     std::fs::remove_file(site.path().join("index.json")).unwrap();
-    let (code, r) = e.check();
-    assert_eq!(code, 2);
+    let (rc, r) = e.check();
+    assert_eq!(rc, 2);
     assert!(r["last_error"].as_str().unwrap().contains("404"), "{r}");
     // The app kept running version 2 throughout.
     assert_eq!(
@@ -661,4 +671,68 @@ fn queued_jobs_survive_an_agent_crash() {
         .map(|f| f.file_name().to_string_lossy().into_owned())
         .collect();
     assert!(left.is_empty(), "stale files left in incoming/: {left:?}");
+}
+
+impl Env {
+    fn homingctl(&self, args: &[&str]) -> (i32, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_homingctl"))
+            .arg("--config")
+            .arg(&self.config)
+            .args(args)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code().unwrap(), text)
+    }
+
+    fn current_version_code(&self) -> u64 {
+        let a = self.app();
+        a["slots"][a["current"].as_str().unwrap()]["version_code"]
+            .as_u64()
+            .unwrap()
+    }
+}
+
+#[test]
+fn manual_rollback() {
+    let e = Env::new();
+    // Nothing to roll back to yet.
+    let (rc, out) = e.homingctl(&["rollback", ID]);
+    assert_ne!(rc, 0, "{out}");
+    assert_eq!(code(&e.install(&e.pkg("v1.homing", 1, "ok", |_| {}))), "");
+    let (rc, out) = e.homingctl(&["rollback", ID]);
+    assert_ne!(rc, 0);
+    assert!(out.contains("no previous version"), "{out}");
+
+    // v2 installed; roll back to v1.
+    assert_eq!(code(&e.install(&e.pkg("v2.homing", 2, "ok", |_| {}))), "");
+    let (rc, out) = e.homingctl(&["rollback", ID, "--wait"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("rolled_back"), "{out}");
+    assert_eq!(e.current_version_code(), 1);
+    let a = e.app();
+    assert_eq!(a["slots"]["b"]["status"], "bad");
+    e.wait_for("app restarted", |e| e.app()["process"]["ready"] == true);
+
+    // v1 has no previous version now (v2 is bad): a second rollback is refused.
+    let (rc, _) = e.homingctl(&["rollback", ID]);
+    assert_ne!(rc, 0);
+
+    // Reinstall v2 with min_version_code 2: the floor now forbids going back to v1.
+    let v2b = e.pkg("v2b.homing", 2, "ok", |m| m.min_version_code = 2);
+    assert_eq!(code(&e.install(&v2b)), "");
+    let (rc, out) = e.homingctl(&["rollback", ID]);
+    assert_ne!(rc, 0);
+    assert!(out.contains("E_ROLLBACK"), "{out}");
+    assert_eq!(e.current_version_code(), 2);
+
+    // Not an admin-only concern here, but unknown apps and bad ids are rejected.
+    let (rc, _) = e.homingctl(&["rollback", "com.example.missing"]);
+    assert_ne!(rc, 0);
+    let (rc, _) = e.homingctl(&["rollback", "Not An Id"]);
+    assert_ne!(rc, 0);
 }

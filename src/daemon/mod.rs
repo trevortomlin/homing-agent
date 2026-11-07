@@ -54,6 +54,9 @@ pub struct JobError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub job_id: String,
+    /// What the job does.
+    #[serde(default)]
+    pub kind: JobKind,
     pub source: String,
     pub state: JobState,
     #[serde(default)]
@@ -77,6 +80,17 @@ pub struct Active {
     /// Slot that was committed when the job switched (rollback target).
     #[serde(default)]
     pub prev: Option<Slot>,
+}
+
+/// Kind of job.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// Install a package.
+    #[default]
+    Install,
+    /// Return an app to its previous version (`rollback` RPC).
+    Rollback,
 }
 
 /// A job waiting in the queue, with its package file in incoming/.
@@ -129,11 +143,12 @@ impl Agent {
                 .is_some_and(|a| a.job.app_id.as_deref() == Some(app_id))
     }
 
-    /// Whether an HTTP-sourced install of this version failed or was rolled back recently (the
-    /// job history), so the source does not download it again and again.
+    /// Whether this version recently failed an HTTP-sourced install, was rolled back, or was
+    /// rolled back by an administrator (the job history), so the HTTP source does not install it
+    /// again and again.
     fn failed_before(&self, app_id: &str, version_code: u64) -> bool {
         self.lock_state().history.iter().any(|j| {
-            j.source == "http"
+            (j.source == "http" || j.kind == JobKind::Rollback)
                 && j.app_id.as_deref() == Some(app_id)
                 && j.version_code == Some(version_code)
                 && http::is_failure(j.state)
@@ -166,6 +181,7 @@ impl Agent {
         std::fs::rename(&real, &dest).map_err(io)?;
         let job = Job {
             job_id: job_id.clone(),
+            kind: JobKind::Install,
             source: source.chars().take(32).collect(),
             state: JobState::Queued,
             app_id: hint.map(|(id, _)| id.to_owned()),
@@ -256,6 +272,37 @@ impl Agent {
         self.save()?;
         self.tx.send(id).context("job worker stopped")?;
         Ok(())
+    }
+
+    /// Queue a rollback of `app_id` to its previous version. Checked again when it runs.
+    fn request_rollback(&self, app_id: &str) -> Result<String, rpc::RpcError> {
+        let (current, prev) = pipeline::rollback_target(self, app_id)?;
+        if self.has_job_for(app_id) {
+            return Err(rpc::RpcError::spec(
+                ErrorCode::Busy,
+                "an install or rollback for this app is queued or running",
+            ));
+        }
+        let job_id = new_job_id();
+        let job = Job {
+            job_id: job_id.clone(),
+            kind: JobKind::Rollback,
+            source: "rollback".into(),
+            state: JobState::Queued,
+            app_id: Some(app_id.to_owned()),
+            version: Some(current.1.clone()),
+            version_code: Some(current.2),
+            slot: Some(current.0),
+            error: None,
+        };
+        self.enqueue(job, PathBuf::new())
+            .map_err(|e| rpc::RpcError::spec(ErrorCode::Io, e.to_string()))?;
+        eprintln!(
+            "homing-agent: queued rollback {job_id}: {app_id} {} -> slot {}",
+            current.1,
+            prev.name()
+        );
+        Ok(job_id)
     }
 
     /// Take the next queued job and make it the active one (state `verifying`), persisting

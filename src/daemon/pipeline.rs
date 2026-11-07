@@ -9,7 +9,7 @@ use homing_format::manifest::{BuildMode, HealthMode};
 use homing_format::{ErrorCode, Manifest, VerifyOptions};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::{Agent, JobState};
+use super::{Agent, JobKind, JobState};
 use crate::launch::{META_DIR, prepare_slot};
 use crate::layout::{
     Floors, Slot, SlotInfo, SlotStatus, SlotsFile, current_slot, fsync_dir, fsync_tree, read_json,
@@ -40,8 +40,18 @@ pub async fn worker(agent: Arc<Agent>, mut rx: UnboundedReceiver<String>) {
     }
 }
 
-/// Run the active job (already persisted as `verifying` by `Agent::start_next`).
+/// Run the active job (already persisted by `Agent::start_next`).
 async fn run_job(agent: &Arc<Agent>, file: PathBuf) {
+    let rollback = agent
+        .lock_state()
+        .active
+        .as_ref()
+        .filter(|a| a.job.kind == JobKind::Rollback)
+        .and_then(|a| a.job.app_id.clone());
+    if let Some(id) = rollback {
+        manual_rollback(agent, &id).await;
+        return;
+    }
     // Verify + extract + finalize on a blocking thread.
     let a2 = agent.clone();
     let staged = tokio::task::spawn_blocking(move || stage(&a2, &file))
@@ -304,6 +314,73 @@ fn restore_previous(
     Ok(target.is_some())
 }
 
+/// For a manual rollback of `id`: the committed slot `(slot, version, version_code)` and the
+/// previous slot to return to. Fails if there is none, or if the previous version is below the
+/// anti-rollback floor (`E_ROLLBACK`).
+pub(super) fn rollback_target(
+    agent: &Agent,
+    id: &str,
+) -> Result<((Slot, String, u64), Slot), crate::rpc::RpcError> {
+    use crate::rpc::RpcError;
+    homing_format::manifest::validate_app_id(id)
+        .map_err(|e| RpcError::plain(crate::rpc::INVALID_PARAMS, e.to_string()))?;
+    let slots: SlotsFile = read_json(&agent.layout.slots_file(id))
+        .map_err(|e| RpcError::spec(ErrorCode::Io, format!("{e:#}")))?;
+    let not_possible = |m: String| RpcError::plain(crate::rpc::INVALID_PARAMS, m);
+    let current = slots
+        .committed
+        .ok_or_else(|| not_possible(format!("{id} has no committed version")))?;
+    let cur = slots
+        .get(current)
+        .ok_or_else(|| not_possible(format!("{id} has no committed version")))?;
+    let prev = current.other();
+    let p = slots
+        .get(prev)
+        .filter(|i| i.status == SlotStatus::Previous)
+        .ok_or_else(|| not_possible(format!("{id} has no previous version to roll back to")))?;
+    let floors: crate::layout::Floors = read_json(&agent.layout.floors()).unwrap_or_default();
+    let floor = floors.get(id).copied().unwrap_or(0);
+    if p.version_code < floor {
+        return Err(RpcError::spec(
+            ErrorCode::Rollback,
+            format!(
+                "previous version {} (version_code {}) is below the anti-rollback floor {floor}",
+                p.version, p.version_code
+            ),
+        ));
+    }
+    Ok(((current, cur.version.clone(), cur.version_code), prev))
+}
+
+/// Run a queued manual rollback: re-check it, then mark the current version bad and switch back.
+async fn manual_rollback(agent: &Arc<Agent>, id: &str) {
+    let (current, prev) = match rollback_target(agent, id) {
+        Ok(t) => t,
+        Err(e) => {
+            let code = e
+                .spec_code()
+                .and_then(ErrorCode::parse)
+                .unwrap_or(ErrorCode::Io);
+            let _ = agent.finish_active(JobState::Failed, Some((code, e.message)));
+            return;
+        }
+    };
+    let _ = agent.update_active(|a| {
+        a.job.state = JobState::RollingBack;
+        a.job.slot = Some(current.0);
+        a.prev = Some(prev);
+    });
+    match restore_previous(agent, id, current.0, Some(prev)) {
+        Ok(_) => {
+            agent.sup.restart(id).await;
+            let _ = agent.finish_active(JobState::RolledBack, None);
+        }
+        Err(e) => {
+            let _ = agent.finish_active(JobState::Failed, Some(io_fail(e)));
+        }
+    }
+}
+
 /// Finish or undo whatever job was active when the agent last stopped.
 pub async fn recover(agent: &Arc<Agent>) -> anyhow::Result<()> {
     let active = agent.lock_state().active.clone();
@@ -373,7 +450,7 @@ pub async fn recover(agent: &Arc<Agent>) -> anyhow::Result<()> {
         let mut s = agent.lock_state();
         let mut gone = vec![];
         for q in std::mem::take(&mut s.queued) {
-            if q.file.is_file() {
+            if q.job.kind == JobKind::Rollback || q.file.is_file() {
                 s.queued.push_back(q);
             } else {
                 gone.push(q);
