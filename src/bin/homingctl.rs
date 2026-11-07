@@ -39,6 +39,12 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Check the HTTP update source now and queue any update it offers.
+    Check {
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one job.
     Job {
         /// Job id, as printed by `install`.
@@ -90,6 +96,19 @@ fn run() -> Result<ExitCode> {
             } else {
                 Ok(ExitCode::SUCCESS)
             }
+        }
+        Cmd::Check { json } => {
+            let r = c.call("source.check", Value::Null)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print_http(&r);
+            }
+            Ok(if r["last_error"].is_null() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
         }
         Cmd::Job { job_id, wait } => {
             if wait {
@@ -147,6 +166,37 @@ fn wait_job(c: &mut Client, id: &str) -> Result<ExitCode> {
     }
 }
 
+/// Print the result of an HTTP source check.
+fn print_http(h: &Value) {
+    println!(
+        "http source {}  last check {}",
+        h["index_url"].as_str().unwrap_or("?"),
+        h["last_check"]
+            .as_u64()
+            .map_or_else(|| "never".into(), |t| format!("at {t} (device clock)"))
+    );
+    if let Some(e) = h["last_error"].as_str() {
+        println!("    error: {e}");
+    }
+    for a in h["apps"].as_array().cloned().unwrap_or_default() {
+        let mut line = format!(
+            "    {}: {}",
+            a["id"].as_str().unwrap_or("?"),
+            a["result"].as_str().unwrap_or("?")
+        );
+        if let Some(vc) = a["version_code"].as_u64() {
+            line += &format!(" (version_code {vc})");
+        }
+        if let Some(j) = a["job_id"].as_str() {
+            line += &format!(" job {j}");
+        }
+        if let Some(m) = a["message"].as_str() {
+            line += &format!(": {m}");
+        }
+        println!("{line}");
+    }
+}
+
 fn print_status(s: &Value) {
     println!(
         "agent {}  engine {}  dev_mode {}",
@@ -185,6 +235,9 @@ fn print_status(s: &Value) {
                 );
             }
         }
+    }
+    if s["sources"]["http"].is_object() {
+        print_http(&s["sources"]["http"]);
     }
     for j in s["jobs"]
         .as_array()

@@ -37,6 +37,36 @@ pub struct Config {
     pub embedders: Embedders,
     #[serde(default)]
     pub apps: BTreeMap<String, AppPolicy>,
+    /// Update sources besides `homingctl install`.
+    #[serde(default)]
+    pub source: Sources,
+}
+
+/// Update sources.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sources {
+    /// Poll a signed index over HTTP(S).
+    #[serde(default)]
+    pub http: Option<HttpSource>,
+}
+
+/// `[source.http]`: poll a signed `index.json` and install updates from it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSource {
+    /// URL of `index.json` (`http://` or `https://`); `index.json.sig` is fetched from beside it.
+    pub index_url: String,
+    /// Seconds between checks.
+    #[serde(default = "d_interval")]
+    pub interval_s: u64,
+    /// Up to this many seconds of random delay added to every check, so a fleet does not poll
+    /// at the same moment.
+    #[serde(default = "d_jitter")]
+    pub jitter_s: u64,
+    /// Timeout for each HTTP request, including a whole package download.
+    #[serde(default = "d_timeout")]
+    pub timeout_s: u64,
 }
 
 /// Per-embedder settings.
@@ -115,6 +145,15 @@ fn d_flutter_pi() -> PathBuf {
 fn d_true() -> bool {
     true
 }
+fn d_interval() -> u64 {
+    3600
+}
+fn d_jitter() -> u64 {
+    600
+}
+fn d_timeout() -> u64 {
+    600
+}
 
 impl Config {
     /// Load and validate a config file. Relative paths are resolved against its directory.
@@ -142,6 +181,16 @@ impl Config {
         }
         if c.restart_delay_ms > 600_000 {
             bail!("restart_delay_ms too large");
+        }
+        if let Some(h) = &c.source.http {
+            let u = url::Url::parse(&h.index_url)
+                .map_err(|e| anyhow::anyhow!("[source.http] index_url: {e}"))?;
+            if !matches!(u.scheme(), "http" | "https") || u.host().is_none() {
+                bail!("[source.http] index_url must be an http:// or https:// URL");
+            }
+            if h.interval_s < 10 || h.timeout_s == 0 {
+                bail!("[source.http] interval_s must be at least 10 and timeout_s positive");
+            }
         }
         Ok(c)
     }
@@ -177,6 +226,31 @@ mod tests {
         assert!(c.policy("com.example.a").autostart);
         assert_eq!(c.policy("com.example.a").allowed_args, ["--rotation"]);
         assert!(c.policy("com.example.b").allowed_args.is_empty());
+    }
+
+    #[test]
+    fn http_source() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("agent.toml");
+        std::fs::write(
+            &p,
+            "[source.http]\nindex_url = \"http://updates.example.com/a/index.json\"\n",
+        )
+        .unwrap();
+        let h = Config::load(&p).unwrap().source.http.unwrap();
+        assert_eq!((h.interval_s, h.jitter_s, h.timeout_s), (3600, 600, 600));
+        for bad in [
+            "index_url = \"ftp://x/index.json\"",
+            "index_url = \"file:///etc/index.json\"",
+            "index_url = \"not a url\"",
+            "index_url = \"http://x/i.json\"\ninterval_s = 1",
+            "index_url = \"http://x/i.json\"\nextra = 1",
+        ] {
+            std::fs::write(&p, format!("[source.http]\n{bad}\n")).unwrap();
+            assert!(Config::load(&p).is_err(), "{bad}");
+        }
+        std::fs::write(&p, "").unwrap();
+        assert!(Config::load(&p).unwrap().source.http.is_none());
     }
 
     #[test]

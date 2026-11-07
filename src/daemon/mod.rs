@@ -1,6 +1,7 @@
 //! The `homing-agent` daemon.
 
 mod api;
+pub mod http;
 mod pipeline;
 pub mod supervisor;
 
@@ -16,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::layout::{Layout, Slot, read_json, write_json};
+use crate::rpc;
 use supervisor::Supervisor;
 
 /// How many finished jobs to remember.
@@ -97,11 +99,82 @@ pub struct Agent {
     /// Queued (not yet started) jobs with their files in incoming/.
     queued: Mutex<VecDeque<(Job, PathBuf)>>,
     tx: mpsc::UnboundedSender<String>,
+    /// Result of the last HTTP source check.
+    http_status: Mutex<http::HttpStatus>,
+    /// Serializes HTTP source checks (periodic and on demand).
+    http_check: tokio::sync::Mutex<()>,
 }
 
 impl Agent {
     fn lock_queued(&self) -> std::sync::MutexGuard<'_, VecDeque<(Job, PathBuf)>> {
         self.queued.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_http(&self) -> std::sync::MutexGuard<'_, http::HttpStatus> {
+        self.http_status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether an install for `app_id` is queued or running.
+    fn has_job_for(&self, app_id: &str) -> bool {
+        self.lock_queued()
+            .iter()
+            .any(|(j, _)| j.app_id.as_deref() == Some(app_id))
+            || self
+                .lock_state()
+                .active
+                .as_ref()
+                .is_some_and(|a| a.job.app_id.as_deref() == Some(app_id))
+    }
+
+    /// Whether an HTTP-sourced install of this version failed or was rolled back recently (the
+    /// job history), so the source does not download it again and again.
+    fn failed_before(&self, app_id: &str, version_code: u64) -> bool {
+        self.lock_state().history.iter().any(|j| {
+            j.source == "http"
+                && j.app_id.as_deref() == Some(app_id)
+                && j.version_code == Some(version_code)
+                && http::is_failure(j.state)
+        })
+    }
+
+    /// Queue an install of `file`, which must be a regular file directly inside incoming/.
+    /// It is renamed to `job-<id>.homing` first, so its source can no longer change it.
+    /// `hint` (app id, version code) is shown until the package's own manifest is read.
+    fn submit(
+        &self,
+        file: &std::path::Path,
+        source: &str,
+        hint: Option<(&str, u64)>,
+    ) -> Result<String, rpc::RpcError> {
+        let io = |e: std::io::Error| rpc::RpcError::spec(ErrorCode::Io, e.to_string());
+        let perm = |m: &str| rpc::RpcError::spec(ErrorCode::Perm, m);
+        let incoming = std::fs::canonicalize(self.layout.incoming()).map_err(io)?;
+        let real = std::fs::canonicalize(file).map_err(io)?;
+        if real.parent() != Some(incoming.as_path()) {
+            return Err(perm(
+                "path must be a file directly inside the agent's incoming/ directory",
+            ));
+        }
+        if !std::fs::symlink_metadata(&real).map_err(io)?.is_file() {
+            return Err(perm("path is not a regular file"));
+        }
+        let job_id = new_job_id();
+        let dest = incoming.join(format!("job-{job_id}.homing"));
+        std::fs::rename(&real, &dest).map_err(io)?;
+        let job = Job {
+            job_id: job_id.clone(),
+            source: source.chars().take(32).collect(),
+            state: JobState::Queued,
+            app_id: hint.map(|(id, _)| id.to_owned()),
+            version: None,
+            version_code: hint.map(|(_, vc)| vc),
+            slot: None,
+            error: None,
+        };
+        self.enqueue(job, dest)
+            .map_err(|e| rpc::RpcError::spec(ErrorCode::Io, e.to_string()))?;
+        eprintln!("homing-agent: queued job {job_id} from {source}");
+        Ok(job_id)
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AgentState> {
@@ -223,6 +296,8 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         state: Mutex::new(state),
         queued: Mutex::new(VecDeque::new()),
         tx,
+        http_status: Mutex::new(http::HttpStatus::default()),
+        http_check: tokio::sync::Mutex::new(()),
     });
 
     pipeline::recover(&agent).await?;
@@ -237,6 +312,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         agent.cfg.dev_mode
     );
     tokio::spawn(pipeline::worker(agent.clone(), rx));
+    tokio::spawn(http::run(agent.clone()));
     let server = tokio::spawn(api::serve(agent.clone(), listener));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

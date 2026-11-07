@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::{Agent, Job, JobState, new_job_id};
+use super::Agent;
 use crate::layout::{SlotsFile, current_slot, read_json};
 use crate::rpc::{self, RpcError};
 
@@ -123,6 +123,15 @@ async fn dispatch(
 ) -> Result<Value, RpcError> {
     match method {
         "status" => Ok(status(agent)),
+        "source.check" => {
+            if !caller.is_admin() {
+                return Err(perm("source.check requires admin"));
+            }
+            match super::http::check_now(agent).await {
+                Ok(s) => Ok(json!(s)),
+                Err(e) => Err(RpcError::plain(rpc::INVALID_REQUEST, format!("{e:#}"))),
+            }
+        }
         "job.get" => {
             let id = param_str(&params, "job_id")?;
             agent
@@ -167,37 +176,7 @@ async fn dispatch(
 }
 
 fn install(agent: &Arc<Agent>, path: &Path, source: &str) -> Result<Value, RpcError> {
-    let io = |e: std::io::Error| RpcError::spec(ErrorCode::Io, e.to_string());
-    // The file must already be inside incoming/ (same filesystem, so the rename is atomic and the
-    // source can no longer modify it afterwards).
-    let incoming = fs::canonicalize(agent.layout.incoming()).map_err(io)?;
-    let real = fs::canonicalize(path).map_err(io)?;
-    if real.parent() != Some(incoming.as_path()) {
-        return Err(perm(
-            "path must be a file directly inside the agent's incoming/ directory",
-        ));
-    }
-    let meta = fs::symlink_metadata(&real).map_err(io)?;
-    if !meta.is_file() {
-        return Err(perm("path is not a regular file"));
-    }
-    let job_id = new_job_id();
-    let dest: PathBuf = incoming.join(format!("job-{job_id}.homing"));
-    fs::rename(&real, &dest).map_err(io)?;
-    let job = Job {
-        job_id: job_id.clone(),
-        source: source.chars().take(32).collect(),
-        state: JobState::Queued,
-        app_id: None,
-        version: None,
-        version_code: None,
-        slot: None,
-        error: None,
-    };
-    agent
-        .enqueue(job, dest)
-        .map_err(|e| RpcError::spec(ErrorCode::Io, e.to_string()))?;
-    eprintln!("homing-agent: queued job {job_id} from {source}");
+    let job_id = agent.submit(path, source, None)?;
     Ok(json!({ "job_id": job_id }))
 }
 
@@ -233,5 +212,8 @@ fn status(agent: &Arc<Agent>) -> Value {
         "apps": apps,
         "current_job": active,
         "jobs": agent.jobs(),
+        "sources": {
+            "http": agent.cfg.source.http.as_ref().map(|_| agent.lock_http().clone()),
+        },
     })
 }

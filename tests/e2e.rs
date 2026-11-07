@@ -25,6 +25,11 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::with_config("")
+    }
+
+    /// An agent whose agent.toml has `extra` appended.
+    fn with_config(extra: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         std::fs::create_dir(root.join("keys")).unwrap();
@@ -55,6 +60,8 @@ restart_delay_ms = 200
 
 [embedders.flutter-pi]
 binary = "{}"
+
+{extra}
 "#,
                 env!("CARGO_BIN_EXE_homing-launch"),
                 env!("CARGO_BIN_EXE_homing-fake-embedder")
@@ -339,4 +346,255 @@ fn app_ready_from_unmanaged_process_is_refused() {
     let err = e.client().call("app.ready", Value::Null).unwrap_err();
     let rpc = err.downcast_ref::<homing_agent::rpc::RpcError>().unwrap();
     assert_eq!(rpc.spec_code(), Some("E_PERM"));
+}
+
+// ---- HTTP update source ----
+
+/// Minimal static file server for `dir` on 127.0.0.1 (one thread, HTTP/1.1, Connection: close).
+fn serve(dir: PathBuf) -> u16 {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut r = BufReader::new(&stream);
+            let mut line = String::new();
+            let _ = r.read_line(&mut line);
+            let path = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            let file = dir.join(path.trim_start_matches('/'));
+            let mut w = &stream;
+            match std::fs::read(&file) {
+                Ok(body) if !path.contains("..") => {
+                    let _ = write!(
+                        w,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = w.write_all(&body);
+                }
+                _ => {
+                    let _ = w.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        }
+    });
+    port
+}
+
+fn sha_size(p: &Path) -> (String, u64) {
+    homing_format::package::sha256_reader(std::fs::File::open(p).unwrap()).unwrap()
+}
+
+/// Sign and publish an index listing `(version_code, engine, url, package file)`.
+fn publish(site: &Path, key: &SecretKey, builds: &[(u64, &str, &str, &Path)]) {
+    let mut index = homing_format::Index::new();
+    for (vc, engine, url, file) in builds {
+        let (sha, size) = sha_size(file);
+        let mut app = homing_format::IndexApp::new(ID, format!("1.0.{vc}"), *vc);
+        let mut b = homing_format::IndexBuild::new(*engine, Arch::Aarch64, *url, sha, size);
+        b.machines = vec!["raspberrypi3-64".into()];
+        app.builds.push(b);
+        index.apps.push(app);
+    }
+    let (doc, sig) = index.sign(key).unwrap();
+    std::fs::write(site.join("index.json"), doc).unwrap();
+    std::fs::write(site.join("index.json.sig"), sig).unwrap();
+}
+
+impl Env {
+    /// `homingctl check --json`: (exit code, result).
+    fn check(&self) -> (i32, Value) {
+        let out = Command::new(env!("CARGO_BIN_EXE_homingctl"))
+            .arg("--config")
+            .arg(&self.config)
+            .args(["check", "--json"])
+            .output()
+            .unwrap();
+        let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+            panic!(
+                "homingctl check: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code().unwrap(), v)
+    }
+
+    fn wait_job(&self, id: &str) -> Value {
+        let t = Instant::now();
+        loop {
+            let j = self
+                .client()
+                .call("job.get", json!({ "job_id": id }))
+                .unwrap();
+            if matches!(
+                j["state"].as_str(),
+                Some("committed" | "rolled_back" | "failed")
+            ) {
+                return j;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "job {id} stuck: {j}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn app_result(r: &Value) -> &Value {
+    &r["apps"][0]
+}
+
+#[test]
+fn http_source_installs_updates_from_a_signed_index() {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::create_dir(site.path().join("pkgs")).unwrap();
+    let port = serve(site.path().to_path_buf());
+    let base = format!("http://127.0.0.1:{port}");
+    let e = Env::with_config(&format!(
+        "[apps.\"{ID}\"]\n\n[source.http]\nindex_url = \"{base}/index.json\"\ninterval_s = 3600\n"
+    ));
+    let key = SecretKey::from_seed(&[5; 32]);
+    let pkg = |vc: u64, mode: &str| {
+        let p = e.pkg(&format!("v{vc}.homing"), vc, mode, |_| {});
+        let dest = site.path().join(format!("pkgs/v{vc}.homing"));
+        std::fs::copy(&p, &dest).unwrap();
+        dest
+    };
+
+    // 1. First install: the app is configured but not installed yet. Relative URL.
+    let v1 = pkg(1, "ok");
+    publish(site.path(), &key, &[(1, ENGINE, "pkgs/v1.homing", &v1)]);
+    let (code, r) = e.check();
+    assert_eq!(
+        (code, app_result(&r)["result"].as_str()),
+        (0, Some("queued")),
+        "{r}"
+    );
+    let j = e.wait_job(app_result(&r)["job_id"].as_str().unwrap());
+    assert_eq!(
+        (j["state"].as_str(), j["source"].as_str()),
+        (Some("committed"), Some("http"))
+    );
+
+    // 2. An update with an absolute URL.
+    let v2 = pkg(2, "ok");
+    publish(
+        site.path(),
+        &key,
+        &[
+            (1, ENGINE, "pkgs/v1.homing", &v1),
+            (2, ENGINE, &format!("{base}/pkgs/v2.homing"), &v2),
+        ],
+    );
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["version_code"], 2, "{r}");
+    let j = e.wait_job(app_result(&r)["job_id"].as_str().unwrap());
+    assert_eq!(j["state"], "committed");
+    assert_eq!(
+        e.app()["slots"][e.app()["current"].as_str().unwrap()]["version_code"],
+        2
+    );
+
+    // 3. Nothing newer: up to date. The status shows the last check.
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["result"], "up_to_date", "{r}");
+    assert_eq!(
+        e.status()["sources"]["http"]["apps"][0]["result"],
+        "up_to_date"
+    );
+
+    // 4. A version that fails its trial is rolled back and not downloaded again.
+    let v3 = pkg(3, "crash");
+    publish(
+        site.path(),
+        &key,
+        &[
+            (2, ENGINE, "pkgs/v2.homing", &v2),
+            (3, ENGINE, "pkgs/v3.homing", &v3),
+        ],
+    );
+    let (_, r) = e.check();
+    let j = e.wait_job(app_result(&r)["job_id"].as_str().unwrap());
+    assert_eq!(j["state"], "rolled_back");
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["result"], "skipped_failed", "{r}");
+
+    // 5. Only a build for another engine: reported, nothing installed.
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    publish(site.path(), &key, &[(4, other, "pkgs/v3.homing", &v3)]);
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["result"], "no_compatible_build", "{r}");
+
+    // 6. The index promises different bytes than the server sends: the download is rejected
+    //    before anything is queued, and no partial file is left behind.
+    let v5 = pkg(5, "ok");
+    publish(site.path(), &key, &[(5, ENGINE, "pkgs/v5.homing", &v5)]);
+    std::fs::write(&v5, b"not the promised package").unwrap();
+    let (_, r) = e.check();
+    assert_eq!(app_result(&r)["result"], "error", "{r}");
+    assert!(
+        app_result(&r)["message"]
+            .as_str()
+            .unwrap()
+            .contains("E_HASH"),
+        "{r}"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(e.root.join("data/incoming"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // 7. A tampered index and an index signed by an untrusted key are rejected as a whole.
+    let doc = std::fs::read_to_string(site.path().join("index.json")).unwrap();
+    std::fs::write(
+        site.path().join("index.json"),
+        doc.replace("1.0.5", "1.0.6"),
+    )
+    .unwrap();
+    let (code, r) = e.check();
+    assert_eq!(code, 2);
+    assert!(r["last_error"].as_str().unwrap().contains("E_SIG"), "{r}");
+    publish(
+        site.path(),
+        &SecretKey::from_seed(&[9; 32]),
+        &[(5, ENGINE, "pkgs/v5.homing", &v5)],
+    );
+    let (code, r) = e.check();
+    assert_eq!(code, 2);
+    assert!(
+        r["last_error"].as_str().unwrap().contains("E_KEY_UNKNOWN"),
+        "{r}"
+    );
+
+    // 8. An unreachable server is an error, not a crash.
+    std::fs::remove_file(site.path().join("index.json")).unwrap();
+    let (code, r) = e.check();
+    assert_eq!(code, 2);
+    assert!(r["last_error"].as_str().unwrap().contains("404"), "{r}");
+    // The app kept running version 2 throughout.
+    assert_eq!(
+        e.app()["slots"][e.app()["current"].as_str().unwrap()]["version_code"],
+        2
+    );
+}
+
+#[test]
+fn check_without_http_source_is_an_error() {
+    let e = Env::new();
+    let out = Command::new(env!("CARGO_BIN_EXE_homingctl"))
+        .arg("--config")
+        .arg(&e.config)
+        .arg("check")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no [source.http]"));
 }
