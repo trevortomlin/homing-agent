@@ -9,7 +9,7 @@ use homing_format::manifest::{BuildMode, HealthMode};
 use homing_format::{ErrorCode, Manifest, VerifyOptions};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::{Agent, Job, JobState};
+use super::{Agent, JobState};
 use crate::launch::{META_DIR, prepare_slot};
 use crate::layout::{
     Floors, Slot, SlotInfo, SlotStatus, SlotsFile, current_slot, fsync_dir, fsync_tree, read_json,
@@ -34,26 +34,14 @@ fn fmt_fail(e: homing_format::Error) -> Fail {
 /// Job worker: runs queued jobs one at a time.
 pub async fn worker(agent: Arc<Agent>, mut rx: UnboundedReceiver<String>) {
     while rx.recv().await.is_some() {
-        while let Some((job, file)) = agent.dequeue() {
-            run_job(&agent, job, file).await;
+        while let Some(file) = agent.start_next() {
+            run_job(&agent, file).await;
         }
     }
 }
 
-async fn run_job(agent: &Arc<Agent>, mut job: Job, file: PathBuf) {
-    job.state = JobState::Verifying;
-    {
-        let mut s = agent.lock_state();
-        s.active = Some(super::Active {
-            job,
-            file: file.clone(),
-            prev: None,
-        });
-    }
-    if let Err(e) = agent.save() {
-        eprintln!("homing-agent: cannot persist state: {e:#}");
-    }
-
+/// Run the active job (already persisted as `verifying` by `Agent::start_next`).
+async fn run_job(agent: &Arc<Agent>, file: PathBuf) {
     // Verify + extract + finalize on a blocking thread.
     let a2 = agent.clone();
     let staged = tokio::task::spawn_blocking(move || stage(&a2, &file))
@@ -380,11 +368,46 @@ pub async fn recover(agent: &Arc<Agent>) -> anyhow::Result<()> {
             }
         }
     }
-    // Stray job files in incoming/ from jobs that never got persisted.
+    // Queued jobs whose package file is gone cannot run.
+    let missing: Vec<super::Queued> = {
+        let mut s = agent.lock_state();
+        let mut gone = vec![];
+        for q in std::mem::take(&mut s.queued) {
+            if q.file.is_file() {
+                s.queued.push_back(q);
+            } else {
+                gone.push(q);
+            }
+        }
+        gone
+    };
+    for q in missing {
+        let mut job = q.job;
+        job.state = JobState::Failed;
+        job.error = Some(super::JobError {
+            code: ErrorCode::Io.as_str().into(),
+            message: "package file disappeared while queued".into(),
+        });
+        eprintln!("homing-agent: job {} lost its package file", job.job_id);
+        agent.lock_state().history.push_back(job);
+    }
+    agent.save()?;
+    // Leftovers in incoming/: interrupted copies and downloads (*.part), downloads that were
+    // never queued (http-*), and job files no queued job refers to.
+    // Compared by file name: queued paths are canonical, read_dir paths may not be.
+    let keep: std::collections::HashSet<std::ffi::OsString> = agent
+        .lock_state()
+        .queued
+        .iter()
+        .filter_map(|q| q.file.file_name().map(ToOwned::to_owned))
+        .collect();
     if let Ok(rd) = fs::read_dir(agent.layout.incoming()) {
         for f in rd.flatten() {
-            let n = f.file_name();
-            if n.to_string_lossy().starts_with("job-") {
+            let n = f.file_name().to_string_lossy().into_owned();
+            let stale = n.ends_with(".part")
+                || n.starts_with("http-")
+                || (n.starts_with("job-") && !keep.contains(&f.file_name()));
+            if stale {
                 let _ = fs::remove_file(f.path());
             }
         }

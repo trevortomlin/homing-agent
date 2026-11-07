@@ -598,3 +598,67 @@ fn check_without_http_source_is_an_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no [source.http]"));
 }
+
+impl Env {
+    /// `homingctl install` without waiting; returns the job id.
+    fn submit(&self, pkg: &Path) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_homingctl"))
+            .arg("--config")
+            .arg(&self.config)
+            .arg("install")
+            .arg(pkg)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("job "))
+            .expect("job id")
+            .trim()
+            .to_owned()
+    }
+}
+
+#[test]
+fn queued_jobs_survive_an_agent_crash() {
+    let mut e = Env::new();
+    // v1 stays in its trial for a long time (alive mode), so v2 has to queue behind it.
+    let v1 = e.pkg("v1.homing", 1, "ok", |m| {
+        m.health.mode = HealthMode::Alive;
+        m.health.trial_s = 600;
+    });
+    let v2 = e.pkg("v2.homing", 2, "ok", |_| {});
+    let j1 = e.submit(&v1);
+    e.wait_for("v1 in trial", |e| {
+        e.client().call("job.get", json!({ "job_id": j1 })).unwrap()["state"] == "trial"
+    });
+    let j2 = e.submit(&v2);
+    let j = e.client().call("job.get", json!({ "job_id": j2 })).unwrap();
+    assert_eq!(j["state"], "queued");
+
+    // Crash, leaving some debris in incoming/ as an interrupted copy or download would.
+    e.kill_agent();
+    let incoming = e.root.join("data/incoming");
+    for stale in [
+        "x.homing.part",
+        "http-com.example.hello-9.homing",
+        "job-orphan.homing",
+    ] {
+        std::fs::write(incoming.join(stale), b"stale").unwrap();
+    }
+    e.start_agent();
+
+    // v1 is rolled back (it was on trial), v2 still runs and commits.
+    assert_eq!(e.wait_job(&j1)["state"], "failed");
+    assert_eq!(e.wait_job(&j2)["state"], "committed");
+    let a = e.app();
+    assert_eq!(
+        a["slots"][a["current"].as_str().unwrap()]["version_code"],
+        2
+    );
+    let left: Vec<String> = std::fs::read_dir(&incoming)
+        .unwrap()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "stale files left in incoming/: {left:?}");
+}

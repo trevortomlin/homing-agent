@@ -79,11 +79,21 @@ pub struct Active {
     pub prev: Option<Slot>,
 }
 
+/// A job waiting in the queue, with its package file in incoming/.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Queued {
+    pub job: Job,
+    pub file: PathBuf,
+}
+
 /// `agent-state.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentState {
     #[serde(default)]
     pub active: Option<Active>,
+    /// Jobs waiting to run, oldest first. Persisted so they survive restarts and power loss.
+    #[serde(default)]
+    pub queued: VecDeque<Queued>,
     #[serde(default)]
     pub history: VecDeque<Job>,
 }
@@ -96,8 +106,6 @@ pub struct Agent {
     pub device: DeviceInfo,
     pub sup: Supervisor,
     state: Mutex<AgentState>,
-    /// Queued (not yet started) jobs with their files in incoming/.
-    queued: Mutex<VecDeque<(Job, PathBuf)>>,
     tx: mpsc::UnboundedSender<String>,
     /// Result of the last HTTP source check.
     http_status: Mutex<http::HttpStatus>,
@@ -106,22 +114,17 @@ pub struct Agent {
 }
 
 impl Agent {
-    fn lock_queued(&self) -> std::sync::MutexGuard<'_, VecDeque<(Job, PathBuf)>> {
-        self.queued.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn lock_http(&self) -> std::sync::MutexGuard<'_, http::HttpStatus> {
         self.http_status.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether an install for `app_id` is queued or running.
     fn has_job_for(&self, app_id: &str) -> bool {
-        self.lock_queued()
+        let s = self.lock_state();
+        s.queued
             .iter()
-            .any(|(j, _)| j.app_id.as_deref() == Some(app_id))
-            || self
-                .lock_state()
-                .active
+            .any(|q| q.job.app_id.as_deref() == Some(app_id))
+            || s.active
                 .as_ref()
                 .is_some_and(|a| a.job.app_id.as_deref() == Some(app_id))
     }
@@ -189,10 +192,10 @@ impl Agent {
 
     /// Find a job by id (queued, active or history).
     pub fn job(&self, id: &str) -> Option<Job> {
-        if let Some((j, _)) = self.lock_queued().iter().find(|(j, _)| j.job_id == id) {
-            return Some(j.clone());
-        }
         let s = self.lock_state();
+        if let Some(q) = s.queued.iter().find(|q| q.job.job_id == id) {
+            return Some(q.job.clone());
+        }
         if let Some(a) = s.active.as_ref().filter(|a| a.job.job_id == id) {
             return Some(a.job.clone());
         }
@@ -204,7 +207,7 @@ impl Agent {
         let s = self.lock_state();
         let mut v: Vec<Job> = s.history.iter().cloned().collect();
         v.extend(s.active.iter().map(|a| a.job.clone()));
-        v.extend(self.lock_queued().iter().map(|(j, _)| j.clone()));
+        v.extend(s.queued.iter().map(|q| q.job.clone()));
         v
     }
 
@@ -249,14 +252,34 @@ impl Agent {
     /// Enqueue an install job for a file already moved into incoming/.
     fn enqueue(&self, job: Job, file: PathBuf) -> Result<()> {
         let id = job.job_id.clone();
-        self.lock_queued().push_back((job, file));
+        self.lock_state().queued.push_back(Queued { job, file });
+        self.save()?;
         self.tx.send(id).context("job worker stopped")?;
         Ok(())
     }
 
-    /// Take the next queued job.
-    fn dequeue(&self) -> Option<(Job, PathBuf)> {
-        self.lock_queued().pop_front()
+    /// Take the next queued job and make it the active one (state `verifying`), persisting
+    /// both in one write so a crash cannot lose the job in between.
+    fn start_next(&self) -> Option<PathBuf> {
+        let file = {
+            let mut s = self.lock_state();
+            if s.active.is_some() {
+                return None;
+            }
+            let mut q = s.queued.pop_front()?;
+            q.job.state = JobState::Verifying;
+            let file = q.file.clone();
+            s.active = Some(Active {
+                job: q.job,
+                file: q.file,
+                prev: None,
+            });
+            file
+        };
+        if let Err(e) = self.save() {
+            eprintln!("homing-agent: cannot persist state: {e:#}");
+        }
+        Some(file)
     }
 }
 
@@ -294,13 +317,18 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         device,
         sup,
         state: Mutex::new(state),
-        queued: Mutex::new(VecDeque::new()),
         tx,
         http_status: Mutex::new(http::HttpStatus::default()),
         http_check: tokio::sync::Mutex::new(()),
     });
 
     pipeline::recover(&agent).await?;
+    // Restart the worker on jobs that were queued when the agent stopped.
+    let pending = agent.lock_state().queued.len();
+    if pending > 0 {
+        eprintln!("homing-agent: {pending} queued job(s) carried over");
+        let _ = agent.tx.send("resume".into());
+    }
     pipeline::autostart(&agent);
 
     let listener = api::bind(&agent.cfg.socket)?;
