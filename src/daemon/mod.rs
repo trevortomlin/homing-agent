@@ -125,6 +125,8 @@ pub struct Agent {
     http_status: Mutex<http::HttpStatus>,
     /// Serializes HTTP source checks (periodic and on demand).
     http_check: tokio::sync::Mutex<()>,
+    /// Group id of `admin_group`, if that group exists.
+    admin_gid: Option<u32>,
 }
 
 impl Agent {
@@ -356,6 +358,15 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         std::fs::canonicalize(&cfg_path).unwrap_or(cfg_path),
         Duration::from_millis(cfg.restart_delay_ms),
     );
+    let admin_gid = cfg.admin_group.as_deref().and_then(|name| {
+        match nix::unistd::Group::from_name(name) {
+            Ok(Some(g)) => Some(g.gid.as_raw()),
+            _ => {
+                eprintln!("homing-agent: admin group {name:?} does not exist; only root and the agent's user are admins");
+                None
+            }
+        }
+    });
     let (tx, rx) = mpsc::unbounded_channel();
     let agent = Arc::new(Agent {
         cfg,
@@ -367,6 +378,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         tx,
         http_status: Mutex::new(http::HttpStatus::default()),
         http_check: tokio::sync::Mutex::new(()),
+        admin_gid,
     });
 
     pipeline::recover(&agent).await?;
@@ -389,6 +401,8 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
     tokio::spawn(pipeline::worker(agent.clone(), rx));
     tokio::spawn(http::run(agent.clone()));
     let server = tokio::spawn(api::serve(agent.clone(), listener));
+    // Recovery is done and the socket accepts connections.
+    crate::notify::notify("READY=1");
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -396,6 +410,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf) -> Result<()> {
         _ = term.recv() => {}
         r = server => { r??; }
     }
+    crate::notify::notify("STOPPING=1");
     eprintln!("homing-agent: shutting down");
     let _ = std::fs::remove_file(&agent.cfg.socket);
     Ok(())

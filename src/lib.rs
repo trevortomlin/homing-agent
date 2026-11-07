@@ -7,4 +7,5 @@ pub mod config;
 pub mod daemon;
 pub mod launch;
 pub mod layout;
+pub mod notify;
 pub mod rpc;

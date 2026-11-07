@@ -48,13 +48,26 @@ pub async fn serve(agent: Arc<Agent>, listener: UnixListener) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 struct Caller {
     uid: u32,
+    gid: u32,
     pid: Option<u32>,
 }
 
 impl Caller {
-    /// Admin = root or the agent's own user. Not yet supported: membership in a `homing-admin` group.
-    fn is_admin(&self) -> bool {
-        self.uid == 0 || self.uid == nix::unistd::geteuid().as_raw()
+    /// Admin = root, the agent's own user, or a member of the configured admin group (primary
+    /// group from the socket credentials, supplementary groups from /proc/<pid>/status).
+    fn is_admin(&self, admin_gid: Option<u32>) -> bool {
+        if self.uid == 0 || self.uid == nix::unistd::geteuid().as_raw() {
+            return true;
+        }
+        let Some(g) = admin_gid else {
+            return false;
+        };
+        self.gid == g
+            || self.pid.is_some_and(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .map(|s| supplementary_groups(&s).contains(&g))
+                    .unwrap_or(false)
+            })
     }
 }
 
@@ -62,6 +75,7 @@ async fn connection(agent: Arc<Agent>, stream: UnixStream) -> Result<()> {
     let cred = stream.peer_cred()?;
     let caller = Caller {
         uid: cred.uid(),
+        gid: cred.gid(),
         pid: cred.pid().and_then(|p| u32::try_from(p).ok()),
     };
     let (r, mut w) = stream.into_split();
@@ -124,7 +138,7 @@ async fn dispatch(
     match method {
         "status" => Ok(status(agent)),
         "rollback" => {
-            if !caller.is_admin() {
+            if !caller.is_admin(agent.admin_gid) {
                 return Err(perm("rollback requires admin"));
             }
             let id = param_str(&params, "id")?;
@@ -132,7 +146,7 @@ async fn dispatch(
             Ok(json!({ "job_id": job_id }))
         }
         "source.check" => {
-            if !caller.is_admin() {
+            if !caller.is_admin(agent.admin_gid) {
                 return Err(perm("source.check requires admin"));
             }
             match super::http::check_now(agent).await {
@@ -148,7 +162,7 @@ async fn dispatch(
                 .ok_or_else(|| RpcError::plain(rpc::INVALID_PARAMS, format!("unknown job {id}")))
         }
         "install" => {
-            if !caller.is_admin() {
+            if !caller.is_admin(agent.admin_gid) {
                 return Err(perm("install requires admin"));
             }
             let path = param_str(&params, "path")?;
@@ -224,4 +238,30 @@ fn status(agent: &Arc<Agent>) -> Value {
             "http": agent.cfg.source.http.as_ref().map(|_| agent.lock_http().clone()),
         },
     })
+}
+
+/// Group ids from the `Groups:` line of /proc/<pid>/status.
+fn supplementary_groups(status: &str) -> Vec<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .map(|g| {
+            g.split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supplementary_groups;
+
+    #[test]
+    fn parses_proc_groups() {
+        let s = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\nGroups:\t10 27 998 \nNSpid:\t1\n";
+        assert_eq!(supplementary_groups(s), vec![10, 27, 998]);
+        assert!(supplementary_groups("Groups:\n").is_empty());
+        assert!(supplementary_groups("Name: x\n").is_empty());
+    }
 }

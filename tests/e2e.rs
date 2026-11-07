@@ -736,3 +736,33 @@ fn manual_rollback() {
     let (rc, _) = e.homingctl(&["rollback", "Not An Id"]);
     assert_ne!(rc, 0);
 }
+
+#[test]
+fn notifies_systemd_when_ready_and_stopping() {
+    let mut e = Env::new();
+    e.kill_agent();
+    let sock_path = e.root.join("notify.sock");
+    let sock = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut agent = Command::new(env!("CARGO_BIN_EXE_homing-agent"))
+        .arg("--config")
+        .arg(&e.config)
+        .env("NOTIFY_SOCKET", &sock_path)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = sock.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    // READY means the socket already accepts requests.
+    e.status();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(agent.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let n = sock.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"STOPPING=1");
+    agent.wait().unwrap();
+}

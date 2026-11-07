@@ -27,6 +27,10 @@ pub struct Config {
     /// Free space to keep beyond the package itself.
     #[serde(default = "d_min_free_mb")]
     pub min_free_mb: u64,
+    /// Members of this group may use admin API calls (install, rollback, source.check), in
+    /// addition to root and the agent's own user. Ignored if the group does not exist.
+    #[serde(default = "d_admin_group")]
+    pub admin_group: Option<String>,
     /// MVP process supervisor: path of the `homing-launch` binary.
     #[serde(default = "d_launcher")]
     pub launcher: PathBuf,
@@ -129,6 +133,9 @@ fn d_keys_dir() -> PathBuf {
 }
 fn d_engine_file() -> PathBuf {
     "/etc/homing/engine.json".into()
+}
+fn d_admin_group() -> Option<String> {
+    Some("homing-admin".into())
 }
 fn d_min_free_mb() -> u64 {
     64
