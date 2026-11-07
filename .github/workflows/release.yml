@@ -1,0 +1,93 @@
+name: Release
+
+# On a version tag: build the agent binaries for each Linux target and publish a GitHub release with the
+# archives and a SHA256SUMS file. Run manually to test the builds without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm } # e.g. Raspberry Pi 3/4/5, 64-bit OS
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq musl-tools
+          # Static binaries; the C code in zstd and ring is compiled with musl-gcc.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+        env:
+          TARGET: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        run: |
+          for b in homing-agent homingctl homing-launch; do
+            target/${{ matrix.target }}/release/$b --version
+          done
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || version="dev-${GITHUB_SHA::8}"
+          name="homing-agent-${version}-${{ matrix.target }}"
+          mkdir -p "$name/bin" "$name/systemd"
+          for b in homing-agent homingctl homing-launch homing-fake-embedder; do
+            cp "target/${{ matrix.target }}/release/$b" "$name/bin/"
+          done
+          cp systemd/homing-agent.service "$name/systemd/"
+          cp README.md LICENSE CHANGELOG.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG section for $version"; exit 1; }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS
+          --title "homing-agent $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
