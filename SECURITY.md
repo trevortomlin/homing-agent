@@ -24,5 +24,4 @@ example running as root) are already known.
 
 ## Supported versions
 
-homing-agent is pre-alpha and has not been audited. Until 1.0, only the latest commit on
-`main` (and later the latest release) receives fixes.
+homing-agent has not been audited. Until 1.0, only the latest release receives fixes.

@@ -8,6 +8,11 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-06
+
+First release, based on homing-format v0.1.0. Static Linux binaries for x86_64 and aarch64.
+Not yet tested on a Raspberry Pi; tested in an aarch64 QEMU VM with real flutter-pi.
+
 ### Added
 
 - `homing-agent` daemon: verified streaming install into A/B slots, atomic switch,
@@ -31,3 +36,6 @@ minor versions may contain breaking changes.
   copies and downloads at startup.
 - `admin_group` (default `homing-admin`): its members may use the admin API calls.
 - Unknown embedders, build modes and health modes from newer format versions are refused.
+
+[Unreleased]: https://github.com/trevortomlin/homing-agent/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/trevortomlin/homing-agent/releases/tag/v0.1.0

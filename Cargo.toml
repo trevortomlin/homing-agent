@@ -1,6 +1,6 @@
 [package]
 name = "homing-agent"
-version = "0.1.0-dev"
+version = "0.1.0"
 description = "On-device agent, launcher and admin CLI for homing app packages"
 edition = "2024"
 rust-version = "1.85"

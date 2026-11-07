@@ -58,6 +58,10 @@ Before committing, remove the patch and run `cargo update -p homing-format` so t
   [Developer Certificate of Origin](https://developercertificate.org/).
 - Keep pull requests focused, one logical change each. CI must pass before merge.
 
+## Releases
+
+See [RELEASING.md](RELEASING.md).
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the MIT license of this
